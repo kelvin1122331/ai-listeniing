@@ -32,7 +32,10 @@ describe("ephemeral session", () => {
     expect(JSON.stringify(data)).not.toContain(server.key);
     expect(data.wsUrl).toContain("access_token=auth_tokens%2Ftemporary");
     const body = JSON.parse(vi.mocked(fetch).mock.calls[0][1]!.body as string);
-    expect(body.uses).toBe(1); expect(body.liveConnectConstraints.model).toBe("models/test-live");
+    expect(body.uses).toBe(1);
+    expect(body.bidiGenerateContentSetup.model).toBe("models/test-live");
+    expect(body.fieldMask).toBe("model");
+    expect(body).not.toHaveProperty("liveConnectConstraints");
     expect(res.headers.get("Cache-Control")).toBe("no-store");
   });
   it("does not claim live availability when token creation fails", async () => {

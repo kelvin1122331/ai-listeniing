@@ -34,10 +34,13 @@ describe("chat route", () => {
     cfg.provider.apiKey = ""; const res = await POST(request({ message: "Halo" }));
     expect(res.status).toBe(503); expect(await res.json()).not.toHaveProperty("reply"); expect(fetch).not.toHaveBeenCalled();
   });
-  it.each([401, 404, 429, 500])("reports upstream HTTP %s without replacing the reply", async status => {
+  it.each([401, 404, 429, 500, 503])("reports upstream HTTP %s without replacing the reply", async status => {
     vi.mocked(fetch).mockResolvedValue(new Response("", { status }));
     const res = await POST(request({ message: "Apa kabar?" }));
-    expect(res.status).toBe(status === 429 ? 429 : 502); expect(await res.json()).not.toHaveProperty("reply");
+    expect(res.status).toBe(status === 429 || status === 503 ? status : 502);
+    const data = await res.json();
+    expect(data).not.toHaveProperty("reply");
+    if (status === 503) expect(data.error).toContain("sedang padat");
     expect(fetch).toHaveBeenCalledTimes(1);
   });
   it("does not discard valid short model replies or expose thinking", async () => {

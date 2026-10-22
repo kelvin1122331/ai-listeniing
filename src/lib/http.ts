@@ -18,5 +18,6 @@ export function providerError(status: number): ProviderError {
   if (status === 401 || status === 403) return new ProviderError(502, "API key ditolak penyedia AI. Periksa key dan izin proyek di pengaturan admin.");
   if (status === 404) return new ProviderError(502, "Model AI tidak tersedia. Pilih model yang tersedia untuk API key ini di pengaturan admin.");
   if (status === 429) return new ProviderError(429, "Kuota atau batas permintaan AI tercapai. Tunggu sebentar atau periksa kuota proyek.");
+  if (status === 503) return new ProviderError(503, "Model AI sedang padat atau sementara tidak tersedia. Tunggu sebentar lalu coba lagi, atau pilih model lain di pengaturan admin.");
   return new ProviderError(502, "Penyedia AI sedang bermasalah. Silakan coba lagi.");
 }

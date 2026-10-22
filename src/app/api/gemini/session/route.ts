@@ -17,7 +17,15 @@ export async function POST(req: NextRequest) {
     const res = await fetch("https://generativelanguage.googleapis.com/v1beta/auth_tokens", {
       method: "POST", cache: "no-store", signal: AbortSignal.timeout(10_000),
       headers: { "Content-Type": "application/json", "x-goog-api-key": cfg.apiKey },
-      body: JSON.stringify({ uses: 1, expireTime: new Date(expiresAt).toISOString(), newSessionExpireTime: new Date(Date.now() + 60_000).toISOString(), liveConnectConstraints: { model: "models/" + cfg.realtimeModel.replace(/^models\//, "") } }),
+      body: JSON.stringify({
+        uses: 1,
+        expireTime: new Date(expiresAt).toISOString(),
+        newSessionExpireTime: new Date(Date.now() + 60_000).toISOString(),
+        // REST uses bidiGenerateContentSetup; liveConnectConstraints is an SDK option.
+        bidiGenerateContentSetup: { model: "models/" + cfg.realtimeModel.replace(/^models\//, "") },
+        // Lock the server-selected model while retaining the client's audio setup.
+        fieldMask: "model",
+      }),
     });
     if (!res.ok) return NextResponse.json({ liveAvailable: false, error: "Gemini Live belum tersedia. Input suara browser dapat digunakan." }, { headers: NO_STORE });
     const token = await res.json();

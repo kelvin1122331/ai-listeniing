@@ -9,6 +9,7 @@ import {
 } from "@/types/companion";
 
 export interface AIProviderRequest {
+  signal?: AbortSignal;
   requestId?: string;
   message: string;
   recentHistory: { role: "user" | "assistant" | "system"; content: string }[];
@@ -71,7 +72,8 @@ export interface AIProvider {
    */
   connectRealtimeSession(
     config: CompanionConfig,
-    callbacks: RealtimeSessionCallbacks
+    callbacks: RealtimeSessionCallbacks,
+    context?: string
   ): Promise<boolean>;
 
   /**

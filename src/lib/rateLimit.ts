@@ -14,6 +14,11 @@ export function checkRateLimit(
   windowMs = 60_000
 ): { allowed: boolean; remaining: number; resetInMs: number } {
   const now = Date.now();
+  maxRequests = Number.isFinite(maxRequests) && maxRequests > 0 ? Math.floor(maxRequests) : 60;
+  if (rateLimitStore.size > 10_000) {
+    for (const [key, value] of rateLimitStore) if (value.resetAt <= now) rateLimitStore.delete(key);
+    if (rateLimitStore.size > 10_000) rateLimitStore.delete(rateLimitStore.keys().next().value!);
+  }
   const existing = rateLimitStore.get(identifier);
 
   if (!existing || now > existing.resetAt) {
@@ -50,6 +55,8 @@ export function checkRateLimit(
 export function sanitizeInputText(input: unknown, maxLength = 4000): string {
   if (typeof input !== "string") return "";
   return input
+    // Remove only non-printing controls; preserve newlines, tabs, and user text.
+    // eslint-disable-next-line no-control-regex
     .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, "")
     .trim()
     .slice(0, maxLength);

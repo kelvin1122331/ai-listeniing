@@ -1,613 +1,263 @@
 "use client";
-
 import { useCallback, useEffect, useRef, useState } from "react";
-import {
-  LipSyncService,
-  VisemeFrame,
-  VISEME_SHAPES,
-} from "@/services/LipSyncService";
 import { AIService } from "@/services/AIService";
-import {
-  AvatarExpression,
-  CompanionConfig,
-  ConversationState,
-  GeminiLiveConnectionStatus,
-} from "@/types/companion";
+import { LipSyncService, VISEME_SHAPES, VisemeFrame } from "@/services/LipSyncService";
+import { AvatarExpression, CompanionConfig, ConversationState, GeminiLiveConnectionStatus } from "@/types/companion";
 
-interface UseVoiceSessionOptions {
-  config: CompanionConfig;
-  conversationState: ConversationState;
+interface Recognition {
+  lang: string; continuous: boolean; interimResults: boolean;
+  onresult: ((event: RecognitionEvent) => void) | null;
+  onerror: ((event: { error: string }) => void) | null;
+  onend: (() => void) | null;
+  start(): void; abort(): void;
+}
+interface RecognitionEvent {
+  resultIndex: number;
+  results: { length: number; [index: number]: { isFinal: boolean; [index: number]: { transcript: string } } };
+}
+interface Options {
+  conversationContext?: string;
+  config: CompanionConfig; conversationState: ConversationState;
   setConversationState: (state: ConversationState) => void;
-  setExpression: (expr: AvatarExpression) => void;
-  onUserSpeechFinal: (transcript: string) => void;
-  onLiveAssistantTranscript?: (text: string, isFinal: boolean) => void;
+  setExpression: (expression: AvatarExpression) => void;
+  onUserSpeechFinal: (text: string) => void;
+  onLiveUserTranscript?: (text: string, final: boolean) => void;
+  onLiveAssistantTranscript?: (text: string, final: boolean) => void;
 }
 
-export function useVoiceSession({
-  config,
-  conversationState,
-  setConversationState,
-  setExpression,
-  onUserSpeechFinal,
-  onLiveAssistantTranscript,
-}: UseVoiceSessionOptions) {
+export function useVoiceSession(options: Options) {
+  const current = useRef(options); current.current = options;
+  const alive = useRef(true);
   const [isListening, setIsListening] = useState(false);
-  const [isMicMuted, setIsMicMuted] = useState(false);
   const [isAiMuted, setIsAiMuted] = useState(false);
+  const muted = useRef(false); muted.current = isAiMuted;
   const [interimTranscript, setInterimTranscript] = useState("");
-  const [visemeFrame, setVisemeFrame] = useState<VisemeFrame>(
-    VISEME_SHAPES.rest
-  );
+  const [visemeFrame, setVisemeFrame] = useState<VisemeFrame>(VISEME_SHAPES.rest);
   const [audioLevel, setAudioLevel] = useState(0);
   const [micError, setMicError] = useState<string | null>(null);
-  const [liveStatus, setLiveStatus] =
-    useState<GeminiLiveConnectionStatus>("disconnected");
-  const [availableVoices, setAvailableVoices] = useState<
-    SpeechSynthesisVoice[]
-  >([]);
+  const [liveStatus, setLiveStatus] = useState<GeminiLiveConnectionStatus>("disconnected");
+  const [availableVoices, setAvailableVoices] = useState<SpeechSynthesisVoice[]>([]);
+  const capture = useRef<{ stream: MediaStream; ctx: AudioContext; node: AudioWorkletNode } | null>(null);
+  const recognition = useRef<Recognition | null>(null);
+  const epoch = useRef(0);
+  const starting = useRef(false);
+  const listening = useRef(false);
+  const playback = useRef<AudioContext | null>(null);
+  const gain = useRef<GainNode | null>(null);
+  const sources = useRef(new Set<AudioBufferSourceNode>());
+  const nextAudioTime = useRef(0);
+  const lipTimer = useRef<ReturnType<typeof setInterval> | null>(null);
+  const utterance = useRef<SpeechSynthesisUtterance | null>(null);
 
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const recognitionRef = useRef<any>(null);
-  const lipSyncIntervalRef = useRef<NodeJS.Timeout | null>(null);
-  const activeUtteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
-  const currentVisemeRef = useRef<VisemeFrame>(VISEME_SHAPES.rest);
-  const audioContextRef = useRef<AudioContext | null>(null);
-  const playbackAudioCtxRef = useRef<AudioContext | null>(null);
-  const micStreamRef = useRef<MediaStream | null>(null);
-  const micAnimFrameRef = useRef<number | null>(null);
-
-  // Load browser TTS voices
-  useEffect(() => {
-    if (typeof window === "undefined" || !("speechSynthesis" in window)) return;
-
-    const loadVoices = () => {
-      const voices = window.speechSynthesis.getVoices();
-      if (voices.length > 0) {
-        setAvailableVoices(voices);
-      }
-    };
-
-    loadVoices();
-    window.speechSynthesis.onvoiceschanged = loadVoices;
-    return () => {
-      if (window.speechSynthesis) {
-        window.speechSynthesis.onvoiceschanged = null;
-      }
-    };
+  const rest = useCallback(() => {
+    if (!alive.current) return;
+    setVisemeFrame(VISEME_SHAPES.rest); setAudioLevel(0);
+    current.current.setConversationState(listening.current ? "LISTENING" : "IDLE");
+    current.current.setExpression(listening.current ? "listening" : "idle");
   }, []);
-
-  /**
-   * Plays raw 24kHz PCM16 base64 audio returned by Gemini Live API
-   * and drives LipSyncService.amplitudeToVisemeFrame.
-   */
-  const playGeminiLivePcmChunk = useCallback(
-    (pcm16Base64: string, amplitude: number) => {
-      if (isAiMuted || config.speakerVolume <= 0) return;
-
-      const targetViseme = LipSyncService.amplitudeToVisemeFrame(
-        amplitude,
-        0.4 + Math.random() * 0.3
-      );
-      const smoothed = LipSyncService.interpolateFrame(
-        currentVisemeRef.current,
-        targetViseme,
-        0.42
-      );
-      currentVisemeRef.current = smoothed;
-      setVisemeFrame(smoothed);
-      setAudioLevel(amplitude);
-
-      try {
-        const AudioCtx =
-          window.AudioContext ||
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          (window as any).webkitAudioContext;
-        if (!AudioCtx) return;
-
-        if (!playbackAudioCtxRef.current) {
-          playbackAudioCtxRef.current = new AudioCtx({ sampleRate: 24000 });
-        }
-        const ctx = playbackAudioCtxRef.current;
-        if (ctx.state === "suspended") {
-          ctx.resume().catch(() => {});
-        }
-
-        const binary = atob(pcm16Base64);
-        const sampleCount = Math.floor(binary.length / 2);
-        const audioBuffer = ctx.createBuffer(1, sampleCount, 24000);
-        const channelData = audioBuffer.getChannelData(0);
-
-        for (let i = 0; i < sampleCount; i++) {
-          const low = binary.charCodeAt(i * 2);
-          const high = binary.charCodeAt(i * 2 + 1);
-          let int16 = (high << 8) | low;
-          if (int16 >= 0x8000) int16 -= 0x10000;
-          channelData[i] = (int16 / 32768) * config.speakerVolume;
-        }
-
-        const source = ctx.createBufferSource();
-        source.buffer = audioBuffer;
-        source.connect(ctx.destination);
-        source.start();
-      } catch {
-        // Ignore audio decoding issues
-      }
-    },
-    [config.speakerVolume, isAiMuted]
-  );
-
-  // Initialize / Reconnect Gemini Live API session
-  const connectGeminiLive = useCallback(async () => {
-    await AIService.connectRealtimeLiveSession(config, {
-      onStatusChange: (status) => {
-        setLiveStatus(status);
-      },
-      onTranscriptUpdate: (text, isFinal, role) => {
-        if (role === "assistant" && onLiveAssistantTranscript) {
-          onLiveAssistantTranscript(text, isFinal);
-        }
-      },
-      onAudioChunk: (pcm16Base64, amplitude) => {
-        playGeminiLivePcmChunk(pcm16Base64, amplitude);
-      },
-      onAvatarStateChange: (state, expr) => {
-        setConversationState(state);
-        setExpression(expr);
-      },
-      onInterrupted: () => {
-        if (typeof window !== "undefined" && "speechSynthesis" in window) {
-          window.speechSynthesis.cancel();
-        }
-        currentVisemeRef.current = VISEME_SHAPES.rest;
-        setVisemeFrame(VISEME_SHAPES.rest);
-        setAudioLevel(0);
-      },
-      onError: (friendlyMessage) => {
-        setMicError(friendlyMessage);
-      },
-    });
-  }, [
-    config,
-    onLiveAssistantTranscript,
-    playGeminiLivePcmChunk,
-    setConversationState,
-    setExpression,
-  ]);
-
-  useEffect(() => {
-    connectGeminiLive();
-    return () => {
-      AIService.disconnectRealtimeSession();
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+  const stopPlayback = useCallback(() => {
+    if (lipTimer.current) clearInterval(lipTimer.current);
+    lipTimer.current = null;
+    if (utterance.current) { utterance.current.onend = null; utterance.current.onerror = null; }
+    utterance.current = null;
+    window.speechSynthesis?.cancel();
+    for (const source of sources.current) { source.onended = null; try { source.stop(); } catch {} }
+    sources.current.clear(); nextAudioTime.current = 0; rest();
+  }, [rest]);
+  const releaseInput = useCallback(() => {
+    epoch.current++; starting.current = false; listening.current = false;
+    if (recognition.current) {
+      recognition.current.onend = null; recognition.current.onresult = null; recognition.current.onerror = null;
+      recognition.current.abort(); recognition.current = null;
+    }
+    if (capture.current) {
+      capture.current.node.port.onmessage = null;
+      capture.current.node.disconnect();
+      capture.current.stream.getTracks().forEach(t => t.stop());
+      void capture.current.ctx.close().catch(() => {});
+      capture.current = null;
+    }
   }, []);
-
-  /**
-   * Immediately stops the AI from speaking (Barge-In / Stop button).
-   */
-  const stopSpeaking = useCallback(
-    (markInterrupted = false) => {
-      if (typeof window !== "undefined" && "speechSynthesis" in window) {
-        window.speechSynthesis.cancel();
-      }
-      activeUtteranceRef.current = null;
-      if (lipSyncIntervalRef.current) {
-        clearInterval(lipSyncIntervalRef.current);
-        lipSyncIntervalRef.current = null;
-      }
-      AIService.interruptRealtimeResponse();
-      currentVisemeRef.current = VISEME_SHAPES.rest;
-      setVisemeFrame(VISEME_SHAPES.rest);
-      setAudioLevel(0);
-
-      if (markInterrupted) {
-        setConversationState("INTERRUPTED");
-        setExpression("interrupted");
-      } else if (conversationState === "SPEAKING") {
-        setConversationState("IDLE");
-        setExpression("idle");
-      }
-    },
-    [conversationState, setConversationState, setExpression]
-  );
-
-  /**
-   * Speaks AI response aloud using clean browser Text-to-Speech while driving
-   * the phoneme/viseme Lip-Sync engine.
-   */
-  const speakText = useCallback(
-    (text: string, lang: "id" | "en" = "id", forceSpeak = false) => {
-      if (lipSyncIntervalRef.current) {
-        clearInterval(lipSyncIntervalRef.current);
-        lipSyncIntervalRef.current = null;
-      }
-      if (typeof window !== "undefined" && "speechSynthesis" in window) {
-        if (window.speechSynthesis.speaking || window.speechSynthesis.pending) {
-          window.speechSynthesis.cancel();
-        }
-      }
-
-      if (
-        !forceSpeak &&
-        (isAiMuted || config.speakerVolume <= 0 || !config.autoSpeak)
-      ) {
-        setConversationState("IDLE");
-        setVisemeFrame(VISEME_SHAPES.rest);
-        setAudioLevel(0);
-        return;
-      }
-
-      // Clean markdown symbols so TTS reads sentences naturally
-      const cleanText = text
-        .replace(/[*_#>`~]/g, "")
-        .replace(/\[.*?\]/g, "")
-        .replace(/\n+/g, ". ")
-        .trim();
-
-      if (!cleanText) {
-        setConversationState("IDLE");
-        return;
-      }
-
-      setConversationState("SPEAKING");
-
-      const timeline = LipSyncService.buildVisemeTimeline(
-        cleanText,
-        config.voiceRate
-      );
-      const totalDurationMs =
-        timeline[timeline.length - 1]?.timeMs || cleanText.length * 55;
-      const startTime = performance.now();
-
-      // Start Lip-Sync & Audio Visualizer Loop
-      lipSyncIntervalRef.current = setInterval(() => {
-        const elapsed = performance.now() - startTime;
-        if (elapsed >= totalDurationMs) {
-          if (lipSyncIntervalRef.current) {
-            clearInterval(lipSyncIntervalRef.current);
-            lipSyncIntervalRef.current = null;
-          }
-          currentVisemeRef.current = VISEME_SHAPES.rest;
-          setVisemeFrame(VISEME_SHAPES.rest);
-          setAudioLevel(0);
-          setConversationState("IDLE");
-          return;
-        }
-
-        let target = VISEME_SHAPES.rest;
-        for (let i = timeline.length - 1; i >= 0; i--) {
-          if (elapsed >= timeline[i].timeMs) {
-            target = timeline[i].frame;
-            break;
-          }
-        }
-
-        const simulatedAmp = Math.min(
-          1,
-          Math.max(0.12, target.openness * 0.9 + Math.random() * 0.15)
-        );
-        const ampFallbackFrame =
-          target.viseme === "rest"
-            ? LipSyncService.amplitudeToVisemeFrame(simulatedAmp * 0.35)
-            : target;
-
-        const smoothed = LipSyncService.interpolateFrame(
-          currentVisemeRef.current,
-          ampFallbackFrame,
-          0.38
-        );
-        currentVisemeRef.current = smoothed;
-        setVisemeFrame(smoothed);
-        setAudioLevel(simulatedAmp);
-      }, 45);
-
-      // Speak via clean Web Speech API
-      if (typeof window !== "undefined" && "speechSynthesis" in window) {
-        try {
-          window.speechSynthesis.resume();
-          const utterance = new SpeechSynthesisUtterance(cleanText);
-          activeUtteranceRef.current = utterance;
-
-          utterance.lang = lang === "id" ? "id-ID" : "en-US";
-          utterance.volume = config.speakerVolume;
-          utterance.rate = config.voiceRate;
-          utterance.pitch = config.voicePitch;
-
-          const voices = window.speechSynthesis.getVoices();
-          if (config.voiceURI && config.voiceURI !== "auto") {
-            const matched = voices.find((v) => v.voiceURI === config.voiceURI);
-            if (matched) utterance.voice = matched;
-          } else {
-            const langPrefix = lang === "id" ? "id" : "en";
-            const naturalVoice = voices.find((v) =>
-              v.lang.toLowerCase().startsWith(langPrefix)
-            );
-            if (naturalVoice) utterance.voice = naturalVoice;
-          }
-
-          utterance.onend = () => {
-            activeUtteranceRef.current = null;
-            if (lipSyncIntervalRef.current) {
-              clearInterval(lipSyncIntervalRef.current);
-              lipSyncIntervalRef.current = null;
-            }
-            currentVisemeRef.current = VISEME_SHAPES.rest;
-            setVisemeFrame(VISEME_SHAPES.rest);
-            setAudioLevel(0);
-            setConversationState("IDLE");
-          };
-
-          utterance.onerror = () => {
-            activeUtteranceRef.current = null;
-          };
-
-          window.speechSynthesis.speak(utterance);
-        } catch {
-          // Lip-sync timeline interval continues smoothly
-        }
-      }
-    },
-    [
-      config.autoSpeak,
-      config.speakerVolume,
-      config.voicePitch,
-      config.voiceRate,
-      config.voiceURI,
-      isAiMuted,
-      setConversationState,
-    ]
-  );
-
-  /**
-   * Starts microphone audio capture, Barge-In interruption detection,
-   * and Web Speech / Gemini Live audio streaming.
-   */
-  const startListening = useCallback(async () => {
-    setMicError(null);
-
-    if (isMicMuted) {
-      setMicError(
-        "Microphone sedang di-mute. Unmute terlebih dahulu untuk berbicara."
-      );
-      return;
-    }
-
-    if (conversationState === "SPEAKING") {
-      stopSpeaking(true);
-    }
-
-    if (
-      typeof navigator !== "undefined" &&
-      navigator.mediaDevices &&
-      navigator.mediaDevices.getUserMedia
-    ) {
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({
-          audio:
-            config.selectedMicrophoneId &&
-            config.selectedMicrophoneId !== "default"
-              ? { deviceId: { exact: config.selectedMicrophoneId } }
-              : true,
-        });
-        micStreamRef.current = stream;
-
-        const AudioCtx =
-          window.AudioContext ||
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          (window as any).webkitAudioContext;
-        if (AudioCtx) {
-          const audioCtx = new AudioCtx();
-          audioContextRef.current = audioCtx;
-          const source = audioCtx.createMediaStreamSource(stream);
-          const analyser = audioCtx.createAnalyser();
-          analyser.fftSize = 256;
-          source.connect(analyser);
-          const dataArray = new Uint8Array(analyser.frequencyBinCount);
-
-          const updateMicLevel = () => {
-            analyser.getByteFrequencyData(dataArray);
-            let sum = 0;
-            for (let i = 0; i < dataArray.length; i++) {
-              sum += dataArray[i];
-            }
-            const avg = sum / dataArray.length / 255;
-            const normLevel = Math.min(1, avg * 2.5);
-            setAudioLevel(normLevel);
-
-            if (
-              normLevel > 0.35 &&
-              config.bargeInEnabled &&
-              typeof window !== "undefined" &&
-              window.speechSynthesis?.speaking
-            ) {
-              stopSpeaking(true);
-            }
-
-            micAnimFrameRef.current = requestAnimationFrame(updateMicLevel);
-          };
-          updateMicLevel();
-        }
-      } catch {
-        setMicError(
-          "Izin mikrofon ditolak atau tidak tersedia. Kamu tetap bisa mengetik pesan di bawah."
-        );
-      }
-    }
-
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const SpeechRecognitionAPI =
-      typeof window !== "undefined"
-        ? // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          (window as any).SpeechRecognition ||
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          (window as any).webkitSpeechRecognition
-        : null;
-
-    if (!SpeechRecognitionAPI) {
-      setIsListening(true);
-      setConversationState("LISTENING");
-      setExpression("listening");
-      setMicError(
-        "Web Speech API tidak tersedia di browser ini. Gunakan tombol 'Quick Voice' atau ketik pesan di bawah!"
-      );
-      return;
-    }
-
-    try {
-      const recognition = new SpeechRecognitionAPI();
-      recognition.lang =
-        config.preferredLanguage === "en" ? "en-US" : "id-ID";
-      recognition.continuous = false;
-      recognition.interimResults = true;
-
-      recognition.onstart = () => {
-        setIsListening(true);
-        setConversationState("LISTENING");
-        setExpression("listening");
-        setInterimTranscript("");
-      };
-
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      recognition.onresult = (event: any) => {
-        let interim = "";
-        let finalText = "";
-
-        for (let i = event.resultIndex; i < event.results.length; i++) {
-          const transcript = event.results[i][0].transcript;
-          if (event.results[i].isFinal) {
-            finalText += transcript;
-          } else {
-            interim += transcript;
-          }
-        }
-
-        if ((interim || finalText) && config.bargeInEnabled) {
-          if (
-            typeof window !== "undefined" &&
-            window.speechSynthesis?.speaking
-          ) {
-            stopSpeaking(true);
-          }
-        }
-
-        if (interim) {
-          setInterimTranscript(interim);
-        }
-
-        if (finalText.trim()) {
-          setInterimTranscript("");
-          setIsListening(false);
-          onUserSpeechFinal(finalText.trim());
-        }
-      };
-
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      recognition.onerror = (event: any) => {
-        if (event.error === "not-allowed") {
-          setMicError(
-            "Akses microphone ditolak oleh browser. Kamu tetap bisa lanjut menggunakan chat teks."
-          );
-        }
-        setIsListening(false);
-        setConversationState("IDLE");
-      };
-
-      recognition.onend = () => {
-        setIsListening(false);
-        if (micAnimFrameRef.current) {
-          cancelAnimationFrame(micAnimFrameRef.current);
-        }
-        if (micStreamRef.current) {
-          micStreamRef.current.getTracks().forEach((t) => t.stop());
-          micStreamRef.current = null;
-        }
-        setAudioLevel(0);
-      };
-
-      recognitionRef.current = recognition;
-      recognition.start();
-    } catch {
-      setMicError(
-        "Voice input gagal diinisialisasi. Silakan gunakan tombol 'Quick Voice' atau kolom chat."
-      );
-      setIsListening(false);
-      setConversationState("IDLE");
-    }
-  }, [
-    config.bargeInEnabled,
-    config.preferredLanguage,
-    config.selectedMicrophoneId,
-    conversationState,
-    isMicMuted,
-    onUserSpeechFinal,
-    setConversationState,
-    setExpression,
-    stopSpeaking,
-  ]);
-
   const stopListening = useCallback(() => {
-    if (recognitionRef.current) {
-      try {
-        recognitionRef.current.stop();
-      } catch {
-        // Ignore
-      }
-      recognitionRef.current = null;
+    releaseInput(); AIService.sendRealtimeAudioChunk("");
+    AIService.disconnectRealtimeSession(); stopPlayback();
+    if (alive.current) { setIsListening(false); setInterimTranscript(""); }
+  }, [releaseInput, stopPlayback]);
+  const stopSpeaking = useCallback((markInterrupted = false) => {
+    stopPlayback(); AIService.interruptRealtimeResponse();
+    if (markInterrupted && alive.current) {
+      current.current.setExpression(listening.current ? "listening" : "interrupted");
     }
-    if (micAnimFrameRef.current) {
-      cancelAnimationFrame(micAnimFrameRef.current);
-      micAnimFrameRef.current = null;
-    }
-    if (micStreamRef.current) {
-      micStreamRef.current.getTracks().forEach((t) => t.stop());
-      micStreamRef.current = null;
-    }
-    if (audioContextRef.current) {
-      audioContextRef.current.close().catch(() => {});
-      audioContextRef.current = null;
-    }
-    setIsListening(false);
-    setInterimTranscript("");
-    setAudioLevel(0);
-    if (
-      conversationState === "LISTENING" ||
-      conversationState === "INTERRUPTED"
-    ) {
-      setConversationState("IDLE");
-    }
-  }, [conversationState, setConversationState]);
+  }, [stopPlayback]);
 
   useEffect(() => {
+    alive.current = true;
+    const load = () => setAvailableVoices(window.speechSynthesis?.getVoices() || []);
+    load(); window.speechSynthesis?.addEventListener("voiceschanged", load);
     return () => {
-      if (lipSyncIntervalRef.current) clearInterval(lipSyncIntervalRef.current);
-      if (micAnimFrameRef.current)
-        cancelAnimationFrame(micAnimFrameRef.current);
-      if (micStreamRef.current) {
-        micStreamRef.current.getTracks().forEach((t) => t.stop());
-      }
-      if (typeof window !== "undefined" && "speechSynthesis" in window) {
-        window.speechSynthesis.cancel();
-      }
+      alive.current = false; releaseInput(); AIService.disconnectRealtimeSession(); stopPlayback();
+      window.speechSynthesis?.removeEventListener("voiceschanged", load);
+      void playback.current?.close().catch(() => {}); playback.current = null; gain.current = null;
     };
-  }, []);
+  }, [releaseInput, stopPlayback]);
 
-  return {
-    isListening,
-    isMicMuted,
-    setIsMicMuted,
-    isAiMuted,
-    setIsAiMuted,
-    interimTranscript,
-    visemeFrame,
-    audioLevel,
-    micError,
-    setMicError,
-    liveStatus,
-    reconnectGeminiLive: connectGeminiLive,
-    availableVoices,
-    startListening,
-    stopListening,
-    speakText,
-    stopSpeaking,
-  };
+  useEffect(() => {
+    if (gain.current) gain.current.gain.value = isAiMuted ? 0 : options.config.speakerVolume;
+    if (isAiMuted || options.config.speakerVolume === 0) stopPlayback();
+  }, [isAiMuted, options.config.speakerVolume, stopPlayback]);
+
+  // Changing an input device or Live mode ends the current capture cleanly.
+  useEffect(() => {
+    stopListening();
+  }, [options.config.selectedMicrophoneId, options.config.useGeminiLiveVoice, options.config.preferredLanguage, stopListening]);
+
+  const playPcm = useCallback((base64: string) => {
+    if (muted.current || !alive.current || current.current.config.speakerVolume <= 0) return;
+    try {
+      if (!playback.current) playback.current = new AudioContext({ sampleRate: 24000 });
+      const ctx = playback.current;
+      if (!gain.current) { gain.current = ctx.createGain(); gain.current.connect(ctx.destination); }
+      gain.current.gain.value = current.current.config.speakerVolume;
+      void ctx.resume();
+      const bytes = atob(base64);
+      const buffer = ctx.createBuffer(1, Math.floor(bytes.length / 2), 24000);
+      const channel = buffer.getChannelData(0);
+      let sum = 0;
+      for (let i = 0; i < channel.length; i++) {
+        const int = (bytes.charCodeAt(i * 2 + 1) << 8) | bytes.charCodeAt(i * 2);
+        channel[i] = (int >= 32768 ? int - 65536 : int) / 32768;
+        sum += channel[i] * channel[i];
+      }
+      const amplitude = Math.min(1, Math.sqrt(sum / channel.length) * 3);
+      const source = ctx.createBufferSource(); source.buffer = buffer; source.connect(gain.current);
+      sources.current.add(source);
+      const start = Math.max(ctx.currentTime + 0.015, nextAudioTime.current);
+      nextAudioTime.current = start + buffer.duration;
+      current.current.setConversationState("SPEAKING"); current.current.setExpression("speaking");
+      setAudioLevel(amplitude); setVisemeFrame(LipSyncService.amplitudeToVisemeFrame(amplitude));
+      source.onended = () => { sources.current.delete(source); if (!sources.current.size) rest(); };
+      source.start(start);
+    } catch { setMicError("Audio tidak dapat diputar. Coba mulai ulang suara."); }
+  }, [rest]);
+
+  const connectGeminiLive = useCallback(async () => AIService.connectRealtimeLiveSession(current.current.config, {
+    onStatusChange: status => {
+      if (!alive.current) return;
+      setLiveStatus(status);
+      if (status === "fallback" && capture.current) {
+        releaseInput(); setIsListening(false); stopPlayback();
+        setMicError("Sesi suara terputus. Tekan mikrofon untuk menyambungkan kembali atau gunakan chat.");
+      }
+    },
+    onTranscriptUpdate: (text, final, role) => {
+      if (!alive.current) return;
+      if (role === "assistant") current.current.onLiveAssistantTranscript?.(text, final);
+      else { setInterimTranscript(final ? "" : text); current.current.onLiveUserTranscript?.(text, final); }
+    },
+    onAudioChunk: playPcm,
+    onAvatarStateChange: (state, expression) => { if (alive.current) { current.current.setConversationState(state); current.current.setExpression(expression); } },
+    onInterrupted: stopPlayback,
+    onError: message => { if (alive.current) setMicError(message); },
+  }, current.current.conversationContext), [playPcm, releaseInput, stopPlayback]);
+
+  const startListening = useCallback(async () => {
+    if (listening.current || starting.current) return;
+    starting.current = true; const turn = ++epoch.current;
+    setMicError(null); stopPlayback();
+    let stream: MediaStream | null = null;
+    try {
+      if (!navigator.mediaDevices?.getUserMedia) throw new Error("Mikrofon membutuhkan HTTPS atau localhost dan browser yang mendukung.");
+      // Resume playback in the user's click gesture.
+      if (!playback.current) playback.current = new AudioContext({ sampleRate: 24000 });
+      await playback.current.resume();
+      const config = current.current.config;
+      stream = await navigator.mediaDevices.getUserMedia({ audio: {
+        echoCancellation: true, noiseSuppression: true, autoGainControl: true,
+        ...(config.selectedMicrophoneId !== "default" ? { deviceId: { exact: config.selectedMicrophoneId } } : {}),
+      } });
+      if (turn !== epoch.current) { stream.getTracks().forEach(t => t.stop()); return; }
+      const live = config.useGeminiLiveVoice ? await connectGeminiLive() : false;
+      if (turn !== epoch.current) { stream.getTracks().forEach(t => t.stop()); return; }
+      if (live) {
+        const ctx = new AudioContext({ sampleRate: 16000 });
+        try {
+          await ctx.audioWorklet.addModule("/pcm-capture.js");
+          if (turn !== epoch.current) { await ctx.close(); stream.getTracks().forEach(t => t.stop()); return; }
+          const node = new AudioWorkletNode(ctx, "pcm-capture");
+          const silent = ctx.createGain(); silent.gain.value = 0;
+          ctx.createMediaStreamSource(stream).connect(node); node.connect(silent); silent.connect(ctx.destination);
+          capture.current = { stream, ctx, node };
+          node.port.onmessage = event => {
+            const { buffer, level } = event.data as { buffer: ArrayBuffer; level: number };
+            if (turn !== epoch.current) return;
+            const bytes = new Uint8Array(buffer);
+            let binary = ""; for (const byte of bytes) binary += String.fromCharCode(byte);
+            AIService.sendRealtimeAudioChunk(btoa(binary));
+            if (!sources.current.size) setAudioLevel(Math.min(1, level * 4));
+          };
+          await ctx.resume();
+        } catch (err) { await ctx.close().catch(() => {}); throw err; }
+      } else {
+        stream.getTracks().forEach(t => t.stop()); stream = null;
+        const browser = window as unknown as { SpeechRecognition?: new () => Recognition; webkitSpeechRecognition?: new () => Recognition };
+        const API = browser.SpeechRecognition || browser.webkitSpeechRecognition;
+        if (!API) throw new Error("Input suara tidak didukung browser ini dan Gemini Live belum tersedia. Kamu tetap bisa mengetik.");
+        const rec = new API(); recognition.current = rec;
+        rec.lang = config.preferredLanguage === "en" ? "en-US" : "id-ID";
+        rec.continuous = false; rec.interimResults = true;
+        rec.onresult = event => {
+          let final = "", interim = "";
+          for (let i = event.resultIndex; i < event.results.length; i++) {
+            if (event.results[i].isFinal) final += event.results[i][0].transcript;
+            else interim += event.results[i][0].transcript;
+          }
+          setInterimTranscript(interim);
+          if (final.trim()) { stopListening(); current.current.onUserSpeechFinal(final.trim()); }
+        };
+        rec.onerror = event => {
+          stopListening();
+          if (event.error !== "aborted") setMicError(event.error === "not-allowed" ? "Izin mikrofon ditolak. Izinkan mikrofon di browser atau gunakan chat." : event.error === "no-speech" ? "Belum terdengar suara. Tekan mikrofon untuk mencoba lagi." : "Input suara browser terputus. Coba lagi atau gunakan chat.");
+        };
+        rec.onend = () => { if (recognition.current === rec) stopListening(); };
+        setLiveStatus("fallback"); rec.start();
+      }
+      starting.current = false; listening.current = true; setIsListening(true);
+      current.current.setConversationState("LISTENING"); current.current.setExpression("listening");
+    } catch (err) {
+      stream?.getTracks().forEach(t => t.stop());
+      if (turn !== epoch.current) return;
+      stopListening();
+      setMicError(err instanceof DOMException && err.name === "NotAllowedError" ? "Izin mikrofon ditolak. Izinkan mikrofon di browser atau gunakan chat." : err instanceof Error ? err.message : "Mikrofon tidak dapat dimulai.");
+    }
+  }, [connectGeminiLive, stopListening, stopPlayback]);
+
+  const speakText = useCallback((text: string, lang: "id" | "en" = "id", forceSpeak = false) => {
+    stopPlayback();
+    const { config } = current.current;
+    if (muted.current || config.speakerVolume <= 0 || (!config.autoSpeak && !forceSpeak)) return;
+    if (!window.speechSynthesis) { setMicError("Pembacaan suara tidak tersedia di browser ini."); return; }
+    const clean = text.replace(/\[([^\]]+)\]\([^)]+\)/g, "$1").replace(/[*_#>`~]/g, "").trim();
+    if (!clean) return;
+    const speech = new SpeechSynthesisUtterance(clean);
+    utterance.current = speech;
+    speech.lang = lang === "id" ? "id-ID" : "en-US";
+    speech.volume = config.speakerVolume; speech.rate = config.voiceRate; speech.pitch = config.voicePitch;
+    const voices = window.speechSynthesis.getVoices();
+    speech.voice = voices.find(v => v.voiceURI === config.voiceURI) || voices.find(v => v.lang.startsWith(lang)) || null;
+    speech.onstart = () => {
+      if (utterance.current !== speech) return;
+      current.current.setConversationState("SPEAKING"); current.current.setExpression("speaking");
+      const timeline = LipSyncService.buildVisemeTimeline(clean, config.voiceRate); const start = performance.now();
+      lipTimer.current = setInterval(() => {
+        const elapsed = performance.now() - start;
+        const frame = [...timeline].reverse().find(f => f.timeMs <= elapsed)?.frame || VISEME_SHAPES.rest;
+        setVisemeFrame(frame); setAudioLevel(frame.openness);
+      }, 60);
+    };
+    speech.onend = () => { if (utterance.current === speech) { utterance.current = null; if (lipTimer.current) clearInterval(lipTimer.current); lipTimer.current = null; rest(); } };
+    speech.onerror = () => { if (utterance.current === speech) { stopPlayback(); setMicError("Pembacaan suara gagal. Teks jawaban tetap tersedia."); } };
+    window.speechSynthesis.speak(speech);
+  }, [rest, stopPlayback]);
+
+  return { isListening, isAiMuted, setIsAiMuted, interimTranscript, visemeFrame, audioLevel, micError, setMicError, liveStatus, reconnectGeminiLive: connectGeminiLive, availableVoices, startListening, stopListening, speakText, stopSpeaking };
 }

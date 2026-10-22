@@ -30,6 +30,7 @@ export class AIProviderManager {
 
   static setActiveProvider(providerId: ManagedProviderId): AIProvider {
     if (this.providers[providerId]) {
+      if (providerId !== this.activeProviderId) this.getActiveProvider().disconnectRealtimeSession();
       this.activeProviderId = providerId;
     }
     return this.getActiveProvider();
@@ -51,13 +52,13 @@ export class AIProviderManager {
         data?.activeProvider &&
         ["gemini", "openai", "custom"].includes(data.activeProvider)
       ) {
-        this.activeProviderId = data.activeProvider as ManagedProviderId;
+        this.setActiveProvider(data.activeProvider as ManagedProviderId);
       }
       return {
         activeProvider: this.activeProviderId,
-        textModel: data?.models?.textModel || "gemini-2.0-flash",
+        textModel: data?.models?.textModel || "gemini-3.8-flash",
         realtimeModel:
-          data?.models?.realtimeModel || "models/gemini-2.0-flash-exp",
+          data?.models?.realtimeModel || "gemini-3.8-live",
       };
     } catch {
       return null;

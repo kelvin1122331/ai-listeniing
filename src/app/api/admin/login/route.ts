@@ -9,8 +9,12 @@ import {
 } from "@/lib/adminAuth";
 import { sanitizeInputText } from "@/lib/rateLimit";
 import { ServerConfigStore } from "@/lib/serverConfigStore";
+import { NO_STORE, rejectCrossOrigin } from "@/lib/http";
 
 export async function POST(req: NextRequest) {
+  const rejected = rejectCrossOrigin(req);
+  if (rejected) return rejected;
+  if (!process.env.ADMIN_USERNAME || (process.env.ADMIN_PASSWORD?.length || 0) < 12 || (process.env.ADMIN_SESSION_SECRET?.length || 0) < 32) return NextResponse.json({ error: "Login admin belum dikonfigurasi. Atur ADMIN_USERNAME, ADMIN_PASSWORD (minimal 12 karakter), dan ADMIN_SESSION_SECRET (minimal 32 karakter) di server." }, { status: 503, headers: NO_STORE });
   try {
     const clientIp =
       req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ||
@@ -53,9 +57,8 @@ export async function POST(req: NextRequest) {
       authenticated: true,
       username,
       expiresAt,
-      token,
       initialState: ServerConfigStore.getAdminDashboardState(),
-    });
+    }, { headers: NO_STORE });
 
     attachAdminCookie(res, token, expiresAt);
     return res;

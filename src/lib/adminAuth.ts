@@ -13,10 +13,9 @@ interface FailedLoginRecord {
 const loginFailureStore = new Map<string, FailedLoginRecord>();
 
 function getSessionSecret(): string {
-  return (
-    process.env.ADMIN_SESSION_SECRET ||
-    "aura_companion_hmac_secret_key_2026_v1"
-  );
+  const secret = process.env.ADMIN_SESSION_SECRET;
+  if (!secret || secret.length < 32) throw new Error("ADMIN_SESSION_SECRET minimal 32 karakter wajib diatur.");
+  return secret;
 }
 
 /**
@@ -74,11 +73,12 @@ export function verifyAdminCredentials(
   usernameInput: string,
   passwordInput: string
 ): boolean {
-  const expectedUser = (process.env.ADMIN_USERNAME || "admin").trim();
-  const expectedPass = (process.env.ADMIN_PASSWORD || "kelvin5757").trim();
+  const expectedUser = process.env.ADMIN_USERNAME?.trim();
+  const expectedPass = process.env.ADMIN_PASSWORD;
+  if (!expectedUser || !expectedPass || expectedPass.length < 12) return false;
 
   const cleanUser = usernameInput.trim();
-  const cleanPass = passwordInput.trim();
+  const cleanPass = passwordInput;
 
   const userBufA = Buffer.from(cleanUser);
   const userBufB = Buffer.from(expectedUser);
@@ -134,7 +134,9 @@ export function verifyAdminSessionToken(token: string | undefined | null): {
   }
 
   try {
-    const [payloadB64, sig] = token.trim().split(".");
+    const parts = token.trim().split(".");
+    if (parts.length !== 2) return { valid: false };
+    const [payloadB64, sig] = parts;
     if (!payloadB64 || !sig) return { valid: false };
 
     const expectedSig = crypto
@@ -169,9 +171,8 @@ export function verifyAdminSessionToken(token: string | undefined | null): {
 }
 
 /**
- * Multi-transport admin session verification:
- * Checks X-Admin-Token header, _adminToken query param, Authorization Bearer header, and httpOnly cookie.
- * Guarantees 100% compatibility across reverse proxies and cross-origin preview iframes.
+ * Verifies signed admin cookies or explicit authorization headers.
+ * Session tokens are never accepted in URL query parameters.
  */
 export function verifyAdminRequest(req: NextRequest): {
   authenticated: boolean;
@@ -180,7 +181,6 @@ export function verifyAdminRequest(req: NextRequest): {
 } {
   const candidates: (string | undefined | null)[] = [
     req.headers.get("x-admin-token"),
-    req.nextUrl.searchParams.get("_adminToken"),
     req.headers.get("authorization")?.replace(/^Bearer\s+/i, ""),
     req.cookies.get(ADMIN_COOKIE_NAME)?.value,
   ];
@@ -211,8 +211,8 @@ export function attachAdminCookie(
 ): void {
   res.cookies.set(ADMIN_COOKIE_NAME, token, {
     httpOnly: true,
-    sameSite: "none",
-    secure: true,
+    sameSite: "strict",
+    secure: process.env.NODE_ENV === "production" && process.env.COOKIE_SECURE !== "false",
     path: "/",
     expires: new Date(expiresAt),
   });
@@ -224,8 +224,8 @@ export function attachAdminCookie(
 export function clearAdminCookie(res: NextResponse): void {
   res.cookies.set(ADMIN_COOKIE_NAME, "", {
     httpOnly: true,
-    sameSite: "none",
-    secure: true,
+    sameSite: "strict",
+    secure: process.env.NODE_ENV === "production" && process.env.COOKIE_SECURE !== "false",
     path: "/",
     maxAge: 0,
   });

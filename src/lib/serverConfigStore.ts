@@ -98,10 +98,8 @@ const STORAGE_FILE = path.join(STORAGE_DIR, "ai_configuration.enc.json");
  * Derives a 32-byte AES-256 key from server environment secret.
  */
 function getEncryptionKey(): Buffer {
-  const rawSecret =
-    process.env.CONFIG_ENCRYPTION_KEY ||
-    process.env.ADMIN_SESSION_SECRET ||
-    "aura_aes256_gcm_master_key_32bytes!";
+  const rawSecret = process.env.CONFIG_ENCRYPTION_KEY || process.env.ADMIN_SESSION_SECRET;
+  if (!rawSecret || rawSecret.length < 32) throw new Error("Set CONFIG_ENCRYPTION_KEY atau ADMIN_SESSION_SECRET minimal 32 karakter sebelum menyimpan API key.");
   return crypto.createHash("sha256").update(rawSecret).digest();
 }
 
@@ -162,9 +160,6 @@ export function maskApiKey(plaintext: string): string {
 
 function createInitialStore(): PersistedServerStore {
   const now = new Date().toISOString();
-  const envGeminiKey = process.env.GEMINI_API_KEY?.trim() || "";
-  const envOpenAiKey = process.env.OPENAI_API_KEY?.trim() || "";
-  const envCustomKey = process.env.CUSTOM_API_KEY?.trim() || "";
 
   return {
     activeProvider: "gemini",
@@ -172,21 +167,21 @@ function createInitialStore(): PersistedServerStore {
       gemini: {
         id: "cfg_gemini_01",
         provider: "gemini",
-        api_key_encrypted: envGeminiKey ? encryptSecret(envGeminiKey) : "",
-        text_model: process.env.GEMINI_MODEL || "gemini-2.0-flash",
+        api_key_encrypted: "",
+        text_model: process.env.GEMINI_MODEL || "gemini-3.8-flash",
         realtime_model:
-          process.env.GEMINI_LIVE_MODEL || "models/gemini-2.0-flash-exp",
-        vision_model: "gemini-2.0-flash",
+          process.env.GEMINI_LIVE_MODEL || "gemini-3.8-live",
+        vision_model: process.env.GEMINI_VISION_MODEL || process.env.GEMINI_MODEL || "gemini-3.8-flash",
         voice_model: "Aoede (Gemini Live)",
-        transcription_model: "gemini-2.0-flash",
-        speech_model: "gemini-2.0-flash-exp",
+        transcription_model: "gemini-3.8-live",
+        speech_model: "gemini-3.8-live",
         base_url: "https://generativelanguage.googleapis.com/v1beta",
         updated_at: now,
       },
       openai: {
         id: "cfg_openai_01",
         provider: "openai",
-        api_key_encrypted: envOpenAiKey ? encryptSecret(envOpenAiKey) : "",
+        api_key_encrypted: "",
         text_model: "gpt-4o-mini",
         realtime_model: "gpt-4o-realtime-preview",
         vision_model: "gpt-4o-mini",
@@ -199,7 +194,7 @@ function createInitialStore(): PersistedServerStore {
       custom: {
         id: "cfg_custom_01",
         provider: "custom",
-        api_key_encrypted: envCustomKey ? encryptSecret(envCustomKey) : "",
+        api_key_encrypted: "",
         text_model: "custom-multimodal-v1",
         realtime_model: "custom-realtime-v1",
         vision_model: "custom-vision-v1",
@@ -214,7 +209,7 @@ function createInitialStore(): PersistedServerStore {
     voiceSettings: {
       voiceEnabled: true,
       defaultVoice: "Aoede",
-      realtimeVoiceModel: "models/gemini-2.0-flash-exp",
+      realtimeVoiceModel: "gemini-3.8-live",
       audioQuality: "ultra_low_latency",
       interruptibleVoice: true,
       noiseSuppression: true,
@@ -276,16 +271,18 @@ function loadStore(): PersistedServerStore {
   return initial;
 }
 
-function persistStore(store: PersistedServerStore): void {
-  globalForStore.__auraServerStore = store;
+function persistStore(store: PersistedServerStore, required = false): void {
   try {
     if (!fs.existsSync(STORAGE_DIR)) {
       fs.mkdirSync(STORAGE_DIR, { recursive: true });
     }
-    fs.writeFileSync(STORAGE_FILE, JSON.stringify(store, null, 2), "utf8");
-  } catch {
-    // Keep in-memory store if filesystem is read-only
+    const temporaryFile = STORAGE_FILE + ".tmp";
+    fs.writeFileSync(temporaryFile, JSON.stringify(store, null, 2), { encoding: "utf8", mode: 0o600 });
+    fs.renameSync(temporaryFile, STORAGE_FILE);
+  } catch (error) {
+    if (required) throw error;
   }
+  globalForStore.__auraServerStore = store;
 }
 
 export class ServerConfigStore {
@@ -319,6 +316,7 @@ export class ServerConfigStore {
     const activeRow = store.ai_configuration[store.activeProvider];
 
     return {
+      configured: Boolean(this.getDecryptedProviderConfig().apiKey),
       activeProvider: store.activeProvider,
       models: {
         textModel: activeRow.text_model,
@@ -379,9 +377,9 @@ export class ServerConfigStore {
    * Updates active provider (`gemini`, `openai`, or `custom`).
    */
   static setActiveProvider(provider: AIProviderType) {
-    const store = loadStore();
+    const store = structuredClone(loadStore());
     store.activeProvider = provider;
-    persistStore(store);
+    persistStore(store, true);
     return this.getAdminDashboardState();
   }
 
@@ -401,7 +399,7 @@ export class ServerConfigStore {
     baseUrl?: string;
     setAsActive?: boolean;
   }) {
-    const store = loadStore();
+    const store = structuredClone(loadStore());
     const row = store.ai_configuration[params.provider];
 
     if (params.clearKey) {
@@ -432,7 +430,7 @@ export class ServerConfigStore {
       store.activeProvider = params.provider;
     }
 
-    persistStore(store);
+    persistStore(store, true);
     return this.getAdminDashboardState();
   }
 
@@ -440,13 +438,13 @@ export class ServerConfigStore {
    * Resets a provider's configuration back to default models.
    */
   static resetProviderConfig(provider: AIProviderType) {
-    const store = loadStore();
+    const store = structuredClone(loadStore());
     const defaults = createInitialStore().ai_configuration[provider];
     store.ai_configuration[provider] = {
       ...defaults,
       updated_at: new Date().toISOString(),
     };
-    persistStore(store);
+    persistStore(store, true);
     return this.getAdminDashboardState();
   }
 
@@ -458,7 +456,7 @@ export class ServerConfigStore {
     visionSettings?: Partial<AdminVisionSettings>;
     systemSettings?: Partial<AdminSystemSettings>;
   }) {
-    const store = loadStore();
+    const store = structuredClone(loadStore());
     if (partial.voiceSettings) {
       store.voiceSettings = {
         ...store.voiceSettings,
@@ -477,7 +475,7 @@ export class ServerConfigStore {
         ...partial.systemSettings,
       };
     }
-    persistStore(store);
+    persistStore(store, true);
     return this.getAdminDashboardState();
   }
 

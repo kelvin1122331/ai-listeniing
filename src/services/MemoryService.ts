@@ -30,7 +30,7 @@ export class MemoryService {
       const raw = window.localStorage.getItem(LONG_TERM_MEMORY_STORAGE_KEY);
       if (!raw) return [];
       const parsed = JSON.parse(raw);
-      return Array.isArray(parsed) ? parsed : [];
+      return Array.isArray(parsed) ? parsed.filter((item): item is LongTermMemoryItem => item && typeof item.id === "string" && typeof item.content === "string" && item.content.length <= 300 && typeof item.createdAt === "string" && ["identity", "preference", "interest", "goal", "fact"].includes(item.category)).slice(0, 40) : [];
     } catch {
       return [];
     }
@@ -72,7 +72,7 @@ export class MemoryService {
       const raw = window.sessionStorage.getItem(CONVERSATION_STORAGE_KEY);
       if (!raw) return [];
       const parsed = JSON.parse(raw);
-      return Array.isArray(parsed) ? parsed : [];
+      return Array.isArray(parsed) ? parsed.filter((item): item is ChatMessage => item && typeof item.id === "string" && ["user", "assistant"].includes(item.role) && typeof item.content === "string" && item.content.length <= 16000 && typeof item.timestamp === "string").slice(-30) : [];
     } catch {
       return [];
     }
@@ -227,13 +227,13 @@ export class MemoryService {
     const userTopics = olderMessages
       .filter((m) => m.role === "user")
       .slice(-6)
-      .map((m) => m.content.slice(0, 70))
+      .map((m) => m.content.slice(0, 360))
       .join(" | ");
 
     const lastAiPoint = [...olderMessages]
       .reverse()
       .find((m) => m.role === "assistant")
-      ?.content.slice(0, 110);
+      ?.content.slice(0, 800);
 
     const conversationSummary = `Earlier conversation summary (${olderMessages.length} turns): User discussed [${userTopics || "general greeting"}]. Last assistant point: "${lastAiPoint || "welcomed user"}".`;
 

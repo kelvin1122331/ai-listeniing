@@ -8,7 +8,7 @@ import {
 import { CompanionConfig, UserProfile } from "@/types/companion";
 import { LandingPage } from "@/components/Landing/LandingPage";
 import { MainConversationView } from "@/components/Companion/MainConversationView";
-import { AdminFloatingButton } from "@/components/Admin/AdminFloatingButton";
+import { restoreConfig } from "@/lib/chatValidation";
 import { AIService } from "@/services/AIService";
 
 const CONFIG_STORAGE_KEY = "aura_companion_config_v1";
@@ -40,7 +40,7 @@ export default function HomePage() {
     try {
       const savedConfig = window.localStorage.getItem(CONFIG_STORAGE_KEY);
       if (savedConfig) {
-        setConfig((prev) => ({ ...prev, ...JSON.parse(savedConfig) }));
+        setConfig(restoreConfig(JSON.parse(savedConfig)));
       }
       const savedProfile = window.localStorage.getItem(PROFILE_STORAGE_KEY);
       if (savedProfile) {
@@ -107,12 +107,6 @@ export default function HomePage() {
         />
       )}
 
-      {/* Circular Floating Admin Access Button in Bottom-Right Corner */}
-      <AdminFloatingButton
-        isDark={config.theme === "dark"}
-        inConversationView={inSession}
-        onConfigUpdated={syncBackendProviderConfig}
-      />
     </>
   );
 }

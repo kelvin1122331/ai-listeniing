@@ -1,67 +1,14 @@
 "use client";
-
-import React, { useEffect, useState } from "react";
+import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { AdminLoginModal } from "@/components/Admin/AdminLoginModal";
 import { AdminDashboard } from "@/components/Admin/AdminDashboard";
-import { adminFetch, setAdminSessionToken } from "@/lib/adminClientSession";
-
-export default function AdminProtectedPage() {
-  const router = useRouter();
-  const [checkingSession, setCheckingSession] = useState(true);
-  const [authenticated, setAuthenticated] = useState(false);
-
+export default function AdminPage() {
+  const router = useRouter(); const [status, setStatus] = useState<"checking" | "login" | "ready" | "error">("checking");
   useEffect(() => {
-    const checkSession = async () => {
-      try {
-        const res = await adminFetch("/api/admin/session");
-        if (res.ok) {
-          setAuthenticated(true);
-        } else {
-          setAuthenticated(false);
-        }
-      } catch {
-        setAuthenticated(false);
-      } finally {
-        setCheckingSession(false);
-      }
-    };
-    checkSession();
+    const controller = new AbortController();
+    fetch("/api/admin/session", { cache: "no-store", signal: controller.signal }).then(res => setStatus(res.ok ? "ready" : res.status === 401 ? "login" : "error")).catch(() => { if (!controller.signal.aborted) setStatus("error"); });
+    return () => controller.abort();
   }, []);
-
-  if (checkingSession) {
-    return (
-      <div className="min-h-screen bg-[#060913] text-slate-300 flex items-center justify-center text-sm">
-        Verifying admin session...
-      </div>
-    );
-  }
-
-  if (!authenticated) {
-    return (
-      <div className="min-h-screen bg-[#060913]">
-        <AdminLoginModal
-          isOpen={true}
-          onClose={() => router.push("/")}
-          onLoginSuccess={() => setAuthenticated(true)}
-          isDark={true}
-        />
-      </div>
-    );
-  }
-
-  return (
-    <div className="min-h-screen bg-[#060913]">
-      <AdminDashboard
-        isOpen={true}
-        onClose={() => router.push("/")}
-        onLogout={() => {
-          setAdminSessionToken(null);
-          setAuthenticated(false);
-          router.push("/");
-        }}
-        isDark={true}
-      />
-    </div>
-  );
+  return <div className="aura-app admin-page" data-theme="light">{status === "checking" ? <p className="admin-loading" role="status">Memeriksa sesi admin…</p> : status === "error" ? <div className="admin-loading"><p role="alert">Sesi admin belum dapat diperiksa.</p><button className="secondary-button" onClick={() => location.reload()}>Coba lagi</button></div> : status === "login" ? <AdminLoginModal isOpen onClose={() => router.push("/")} onLoginSuccess={() => setStatus("ready")} /> : <AdminDashboard isOpen onClose={() => router.push("/")} onLogout={() => setStatus("login")} />}</div>;
 }

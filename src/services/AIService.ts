@@ -42,6 +42,7 @@ export class AIService {
    * through the currently active AIProvider with summarized context optimization.
    */
   static async sendMessage(params: {
+    signal?: AbortSignal;
     requestId?: string;
     message: string;
     messagesHistory: ChatMessage[];
@@ -53,10 +54,11 @@ export class AIService {
     visionSummary?: VisionAnalysisSummary;
   }): Promise<AIChatResponsePayload> {
     const { recentHistory, conversationSummary } =
-      MemoryService.buildOptimizedContextWithSummary(params.messagesHistory, 6);
+      MemoryService.buildOptimizedContextWithSummary(params.messagesHistory, 12);
 
     const provider = AIProviderManager.getActiveProvider();
     const result = await provider.sendMessage({
+      signal: params.signal,
       requestId: params.requestId,
       message: params.message,
       recentHistory,
@@ -81,11 +83,13 @@ export class AIService {
 
   static async connectRealtimeLiveSession(
     config: CompanionConfig,
-    callbacks: RealtimeSessionCallbacks
+    callbacks: RealtimeSessionCallbacks,
+    context?: string
   ): Promise<boolean> {
     return AIProviderManager.getActiveProvider().connectRealtimeSession(
       config,
-      callbacks
+      callbacks,
+      context
     );
   }
 
